@@ -191,12 +191,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to get pwru config: %v", err)
 	}
-	if err := bpfSpec.Variables["CFG"].Set(pwruConfig); err != nil {
-		log.Fatalf("Failed to rewrite config: %v", err)
-	}
 
 	bpfSpec.Maps["percpu_big_buff"].ValueSize = flags.SetPerCPUBuf
-	
+
 	haveFexit := pwru.HaveBPFLinkTracing()
 	if (flags.FilterTraceTc || flags.FilterTraceXdp) && !haveFexit {
 		log.Fatalf("Current kernel does not support fentry/fexit to run with --filter-trace-tc/--filter-trace-xdp")
@@ -252,6 +249,10 @@ func main() {
 		log.Fatalf("Failed to load objects: %s\n%+v", verifierLog, err)
 	}
 	defer coll.Close()
+	var key int32 = 0
+	if err := coll.Maps["cfg_map"].Update(key, pwruConfig, ebpf.UpdateAny); err != nil {
+		log.Fatalf("Failed to rewrite config: %v", err)
+	}
 
 	traceTc := false
 	if flags.FilterTraceTc {

@@ -17,6 +17,17 @@
 #define ETH_P_IPV6            0x86dd
 #define ETH_P_8021Q           0x8100
 
+#define BPF_OK 0
+#define BPF_ANY 0
+#define BPF_EXIST 2
+#define BPF_F_FAST_STACK_CMP 512
+
+struct btf_ptr {
+	void *ptr;
+	__u32 type_id;
+	__u32 flags;
+};
+
 #define RTAX_MTU              2
 #define SKB_DST_NOREF         1UL
 #define SKB_DST_PTRMASK       ~(SKB_DST_NOREF)
@@ -27,11 +38,9 @@
 #define __DST_METRICS_PTR(X)  \
 	((u32 *)((X) & ~DST_METRICS_FLAGS))
 
-
-const static bool TRUE = true;
-const static u32 ZERO = 0;
-
+#ifdef bpf_target_x86
 const volatile u32 ENDBR_INSN_SIZE = 0;
+#endif
 
 enum {
 	TRACKED_BY_FILTER = (1 << 0),
@@ -162,8 +171,22 @@ struct config {
 	u32 shinfo_btf_id;
 } __attribute__((packed));
 
-volatile const struct config CFG;
-#define cfg (&CFG)
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, int);
+	__type(value, struct config);
+} cfg_map SEC(".maps");
+
+#define retrieve_cfg(ret) \
+	int cfg_zero = 0; \
+	struct config *cfg = bpf_map_lookup_elem(&cfg_map, &cfg_zero); \
+	if (!cfg) return ret;
+
+#define retrieve_cfg_void \
+	int cfg_zero = 0; \
+	struct config *cfg = bpf_map_lookup_elem(&cfg_map, &cfg_zero); \
+	if (!cfg) return;
 
 #define MAX_STACK_DEPTH 50
 struct {
@@ -230,6 +253,7 @@ get_netns(struct sk_buff *skb) {
 
 static __always_inline bool
 filter_meta(struct sk_buff *skb) {
+	retrieve_cfg(false);
 	if (cfg->netns && get_netns(skb) != cfg->netns) {
 			return false;
 	}
@@ -412,6 +436,7 @@ set_tunnel(struct sk_buff *skb, struct tuple *tpl, struct tuple *tunnel_tpl) {
 
 static __always_inline u64
 sync_fetch_and_add(void *id_map) {
+	u32 ZERO = 0;
 	u32 *id = bpf_map_lookup_elem(id_map, &ZERO);
 	if (id)
 		return ((*id)++) | ((u64)bpf_get_smp_processor_id() << 32);
@@ -420,11 +445,14 @@ sync_fetch_and_add(void *id_map) {
 
 static __always_inline void
 set_skb_btf(struct sk_buff *skb, u64 *event_id) {
+	u32 ZERO = 0;
 	struct btf_ptr p = {};
 	struct print_skb_value *v = (struct print_skb_value *)bpf_map_lookup_elem(&percpu_big_buff, &ZERO);
 	if (!v)
 		return;
 
+	retrieve_cfg_void;
+	
 	u64 id;
 
 	p.type_id = cfg->skb_btf_id;
@@ -441,11 +469,14 @@ set_skb_btf(struct sk_buff *skb, u64 *event_id) {
 
 static __always_inline void
 set_shinfo_btf(struct sk_buff *skb, u64 *event_id) {
+	u32 ZERO = 0;
 	struct skb_shared_info *shinfo;
 	struct btf_ptr p = {};
 	struct print_shinfo_value *v = (struct print_shinfo_value *)bpf_map_lookup_elem(&percpu_big_buff, &ZERO);
 	if (!v)
 		return;
+
+	retrieve_cfg_void;
 
 	unsigned char *head;
 	unsigned int end;
@@ -512,6 +543,7 @@ static __always_inline u64
 get_stackid(void *ctx, const bool is_kprobe) {
 	u64 caller_fp;
 	u64 fp = is_kprobe ? get_kprobe_fp(ctx) : get_tramp_fp();
+	#pragma unroll
 	for (int depth = 0; depth < MAX_STACK_DEPTH; depth++) {
 		if (bpf_probe_read_kernel(&caller_fp, sizeof(caller_fp), (void *)fp) < 0)
 			break;
@@ -526,6 +558,7 @@ get_stackid(void *ctx, const bool is_kprobe) {
 
 static __always_inline void
 set_output(void *ctx, struct sk_buff *skb, struct event_t *event) {
+	retrieve_cfg_void;
 	if (cfg->output_meta) {
 		set_meta(skb, &event->meta);
 	}
@@ -538,13 +571,13 @@ set_output(void *ctx, struct sk_buff *skb, struct event_t *event) {
 		set_tunnel(skb, &event->tuple, &event->tunnel_tuple);
 	}
 
-	if (cfg->output_skb) {
-		set_skb_btf(skb, &event->print_skb_id);
-	}
+	// if (cfg->output_skb) {
+	// 	set_skb_btf(skb, &event->print_skb_id);
+	// }
 
-	if (cfg->output_shinfo) {
-		set_shinfo_btf(skb, &event->print_shinfo_id);
-	}
+	// if (cfg->output_shinfo) {
+	// 	set_shinfo_btf(skb, &event->print_shinfo_id);
+	// }
 
 	if (cfg->output_stack) {
 		event->print_stack_id = bpf_get_stackid(ctx, &print_stack_map, BPF_F_FAST_STACK_CMP);
@@ -567,7 +600,9 @@ handle_everything(struct sk_buff *skb, void *ctx, struct event_t *event, u64 *_s
 	u8 tracked_by;
 	u64 skb_addr = (u64) skb;
 	u64 skb_head = (u64) BPF_CORE_READ(skb, head);
-	u64 stackid;
+	u64 stackid = 0;
+	
+	retrieve_cfg(true);
 
 	if (cfg->track_skb_by_stackid)
 		stackid = _stackid ? *_stackid : get_stackid(ctx, is_kprobe);
@@ -602,6 +637,7 @@ cont:
 		set_output(ctx, skb, event);
 	}
 
+	bool TRUE = true;
 	if (cfg->track_skb && tracked_by == TRACKED_BY_FILTER) {
 		bpf_map_update_elem(&skb_addresses, &skb_addr, &TRUE, BPF_ANY);
 		if (cfg->track_xdp)
@@ -610,8 +646,10 @@ cont:
 
 	if (cfg->track_skb_by_stackid && tracked_by != TRACKED_BY_STACKID) {
 		u64 *old_stackid = bpf_map_lookup_elem(&skb_stackid, &skb);
-		if (old_stackid && *old_stackid != stackid) {
-			bpf_map_delete_elem(&stackid_skb, old_stackid);
+		if (old_stackid) {
+			if (*old_stackid != stackid) {
+				bpf_map_delete_elem(&stackid_skb, old_stackid);
+			}
 		}
 		bpf_map_update_elem(&stackid_skb, &stackid, &skb, BPF_ANY);
 		bpf_map_update_elem(&skb_stackid, &skb, &stackid, BPF_ANY);
@@ -648,6 +686,8 @@ kprobe_skb(struct sk_buff *skb, struct pt_regs *ctx, const bool has_get_func_ip,
 	   u64 *_stackid, const bool kprobe_multi) {
 	struct event_t event = {};
 
+	retrieve_cfg(BPF_OK);
+
 	if (!handle_everything(skb, ctx, &event, _stackid, true))
 		return BPF_OK;
 
@@ -656,7 +696,7 @@ kprobe_skb(struct sk_buff *skb, struct pt_regs *ctx, const bool has_get_func_ip,
 	event.type = kprobe_multi ? EVENT_TYPE_KPROBE_MULTI: EVENT_TYPE_KPROBE;
 	event.param_second = PT_REGS_PARM2(ctx);
 	event.param_third = PT_REGS_PARM3(ctx);
-	if (CFG.output_caller)
+	if (cfg->output_caller)
 		bpf_probe_read_kernel(&event.caller_addr, sizeof(event.caller_addr), (void *)PT_REGS_SP(ctx));
 
 
@@ -702,6 +742,8 @@ int kprobe_skb_lifetime_termination(struct pt_regs *ctx) {
 	struct sk_buff *skb = (typeof(skb)) PT_REGS_PARM1(ctx);
 	u64 skb_addr = (u64) skb;
 
+	retrieve_cfg(BPF_OK);
+
 	bpf_map_delete_elem(&skb_addresses, &skb_addr);
 
 	if (cfg->track_skb_by_stackid) {
@@ -715,6 +757,7 @@ int kprobe_skb_lifetime_termination(struct pt_regs *ctx) {
 
 static __always_inline int
 track_skb_clone(struct sk_buff *old, struct sk_buff *new) {
+	bool TRUE = true;
 	u64 skb_addr_old = (u64) old;
 	u64 skb_addr_new = (u64) new;
 	if (bpf_map_lookup_elem(&skb_addresses, &skb_addr_old))
@@ -753,6 +796,7 @@ detect_tramp_fp(void) {
 	u64 fp, r10;
 
 	r10 = get_tracing_fp(); /* R10 of current bpf prog */
+	#pragma unroll
 	for (int i = 6; i >= 0; i--) {
 		bpf_probe_read_kernel(&fp, sizeof(fp), (void *) (r10 + i * 16));
 		if (r10 < fp && fp < r10 + range_of_detection)
@@ -841,6 +885,7 @@ int BPF_PROG(fentry_tc, struct sk_buff *skb) {
 
 static __always_inline bool
 filter_xdp_netns(struct xdp_buff *xdp) {
+	retrieve_cfg(false);
 	if (cfg->netns && BPF_CORE_READ(xdp, rxq, dev, nd_net.net, ns.inum) != cfg->netns)
 		return false;
 
@@ -849,6 +894,7 @@ filter_xdp_netns(struct xdp_buff *xdp) {
 
 static __always_inline bool
 filter_xdp_ifindex(struct xdp_buff *xdp) {
+	retrieve_cfg(false);
 	if (cfg->ifindex && BPF_CORE_READ(xdp, rxq, dev, ifindex) != cfg->ifindex)
 		return false;
 
@@ -910,6 +956,7 @@ set_xdp_tuple(struct xdp_buff *xdp, struct tuple *tpl) {
 
 static __always_inline void
 set_xdp_output(void *ctx, struct xdp_buff *xdp, struct event_t *event) {
+	retrieve_cfg_void;
 	if (cfg->output_meta)
 		set_xdp_meta(xdp, &event->meta);
 
@@ -930,6 +977,7 @@ SEC("fentry/xdp")
 int BPF_PROG(fentry_xdp, struct xdp_buff *xdp) {
 	struct event_t event = {};
 	u64 xdp_dhs = (u64) BPF_CORE_READ(xdp, data_hard_start);
+	retrieve_cfg(BPF_OK);
 
 	if (cfg->is_set) {
 		if (cfg->track_skb && bpf_map_lookup_elem(&xdp_dhs_skb_heads, &xdp_dhs)) {
@@ -980,6 +1028,7 @@ int kprobe_veth_convert_skb_to_xdp_buff(struct pt_regs *ctx) {
 
 SEC("kretprobe/veth_convert_skb_to_xdp_buff")
 int kretprobe_veth_convert_skb_to_xdp_buff(struct pt_regs *ctx) {
+	bool TRUE = true;
 	u64 pid_tgid = bpf_get_current_pid_tgid();
 	struct sk_buff ***pskb = (struct sk_buff ***)bpf_map_lookup_elem(&veth_skbs, &pid_tgid);
 	if (pskb && *pskb) {
